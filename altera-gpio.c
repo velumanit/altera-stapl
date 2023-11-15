@@ -33,10 +33,34 @@
 #include <stdbool.h>
 #include <gpiod.h>
 #include "altera.h"
-
+#include <sys/ioctl.h>
 #ifndef VERSION
 #define VERSION "unrel"
 #endif
+
+#define JTAG_SIOCSTATE	_IOW(__JTAG_IOCTL_MAGIC, 0, struct jtag_tap_state)
+#define JTAG_SIOCFREQ	_IOW(__JTAG_IOCTL_MAGIC, 1, unsigned int)
+#define JTAG_GIOCFREQ	_IOR(__JTAG_IOCTL_MAGIC, 2, unsigned int)
+#define JTAG_IOCXFER	_IOWR(__JTAG_IOCTL_MAGIC, 3, struct jtag_xfer)
+#define JTAG_GIOCSTATUS _IOWR(__JTAG_IOCTL_MAGIC, 4, enum jtag_tapstate)
+#define JTAG_SIOCMODE	_IOW(__JTAG_IOCTL_MAGIC, 5, unsigned int)
+#define JTAG_IOCBITBANG	_IOW(__JTAG_IOCTL_MAGIC, 6, unsigned int)
+#define JTAG_SIOCTRST	_IOW(__JTAG_IOCTL_MAGIC, 7, unsigned int)
+
+#define __JTAG_IOCTL_MAGIC	0xb2
+#define VALUE_HIGH 	1
+#define VALUE_LOW 	0
+
+struct bitbang_packet {
+	struct tck_bitbang *data;
+	__u32	length;
+} __attribute__((__packed__));
+
+struct tck_bitbang {
+	__u8	tms;
+	__u8	tdi;
+	__u8	tdo;
+} __attribute__((__packed__));
 
 enum gpio_pin {
 	GPIO_TCK = 0,
@@ -51,6 +75,8 @@ static char *gpio_names = NULL;
 static char *gpio_desc = NULL;
 bool verbose = false;
 bool trace = false;
+bool aspeed_jtag_sw_mode = false;
+int jtag_fd;
 
 static void gpio_set_value(int gpio, int value)
 {
@@ -118,6 +144,15 @@ static int initialize_jtag_hardware()
 	struct gpiod_line *line;
 	int i;
 
+	if (aspeed_jtag_sw_mode) {
+		jtag_fd = open("/dev/jtag0", O_RDWR);
+		if (jtag_fd == -1) {
+			printf("Can't open /dev/jtag0 , please install driver!! \n");
+			return -1;
+		}
+		printf("init aspeed jtag \n");
+		return 0;
+	}
 	/* auto-detect */
 	if (!gpio_names && !gpio_desc) {
 		ret = gpio_autodetect_lines();
@@ -206,6 +241,10 @@ static int initialize_jtag_hardware()
 static void close_jtag_hardware()
 {
 	int i;
+	if (aspeed_jtag_sw_mode) {
+		close(jtag_fd);
+		return ;
+	}
 	for (i = 0; i < 4; i++) {
 		gpiod_line_release(gpio_lines[i]);
 		/* make sure all lines are switched back to input mode */
@@ -217,6 +256,26 @@ static void close_jtag_hardware()
 int altera_jtag_io(int tms, int tdi, int read_tdo)
 {
 	int tdo = 0;
+	int retval = 0;
+	struct bitbang_packet bitbang;
+	struct tck_bitbang bitbang_data;
+
+	if (aspeed_jtag_sw_mode) {
+		bitbang_data.tms = tms ? VALUE_HIGH : VALUE_LOW;
+		bitbang_data.tdi = tdi ? VALUE_HIGH : VALUE_LOW;
+		bitbang.length = 1;
+		bitbang.data = &bitbang_data;
+		retval = ioctl(jtag_fd, JTAG_IOCBITBANG, &bitbang);
+		if (retval == -1) {
+			printf("ioctl JTAG Bitbang fail!\n");
+			return (-1);
+		}
+		if (read_tdo)
+		{
+			tdo = (int)bitbang_data.tdo;
+		}
+		return tdo;
+	}
 
 	gpio_set_value(GPIO_TMS, tms);
 	gpio_set_value(GPIO_TDI, tdi);
@@ -303,6 +362,7 @@ void usage(const char *progname)
 			"    -v          : show verbose messages\n"
 			"    -t          : show trace messages\n"
 			"    -i          : show file info only - does not execute any action\n"
+			"    -j          : use aspeed jtag controller\n"
 			"    -a<action>  : specify an action name (Jam STAPL)\n"
 			"    -d<var=val> : initialize variable to specified value (Jam 1.1)\n"
 			"    -d<proc=1>  : enable optional procedure (Jam STAPL)\n"
@@ -332,7 +392,7 @@ int main(int argc, char **argv)
 	unsigned char *file_buffer;
 	off_t file_length;
 
-	while ((opt = getopt(argc, argv, "hvia:d:rg:G:Vt")) != -1) {
+	while ((opt = getopt(argc, argv, "hvija:d:rg:G:Vt")) != -1) {
 		switch (opt) {
 			case 'h':
 				usage(argv[0]);
@@ -343,6 +403,9 @@ int main(int argc, char **argv)
 			case 'i':
 				verbose = true;
 				execute_program = false;
+				break;
+			case 'j':
+				aspeed_jtag_sw_mode = true;
 				break;
 			case 'a':
 				action = optarg;
